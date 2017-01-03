@@ -19,7 +19,7 @@ LOCAL_PATH := $(call my-dir)
 # hw/<OVERLAY_HARDWARE_MODULE_ID>.<ro.product.board>.so
 include $(CLEAR_VARS)
 
-LOCAL_MODULE_PATH := $(TARGET_OUT_VENDOR_SHARED_LIBRARIES)/hw
+LOCAL_MODULE_RELATIVE_PATH := hw
 LOCAL_SHARED_LIBRARIES := liblog libcutils libion libutils libGLESv1_CM
 
 LOCAL_C_INCLUDES := \
@@ -35,7 +35,7 @@ LOCAL_SRC_FILES := 	\
 
 LOCAL_CFLAGS := -DLOG_TAG=\"gralloc\"
 
-ifeq ($(BOARD_USE_BGRA_8888_FB),true)
+ifeq ($(BOARD_USE_BGRA_8888),true)
 LOCAL_CFLAGS += -DUSE_BGRA_8888
 endif
 

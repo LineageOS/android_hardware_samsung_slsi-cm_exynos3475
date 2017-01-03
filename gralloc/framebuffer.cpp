@@ -50,7 +50,9 @@ inline size_t roundUpToPageSize(size_t x) {
 
 /*****************************************************************************/
 
-#define PAGE_FLIP 0x00000001
+// numbers of buffers for page flipping
+#define NUM_BUFFERS 2
+#define HWC_EXIST 1
 
 struct hwc_callback_entry
 {
@@ -66,28 +68,6 @@ struct fb_context_t {
 
 /*****************************************************************************/
 
-/*
- * Copy buffer to the front if page flip is not available/allowed because of
- * size constraints.
- */
-inline void memcpy_buffer(private_module_t* m, buffer_handle_t &buffer) {
-    void* fb_vaddr;
-    void* buffer_vaddr;
-
-    m->base.lock(&m->base, m->framebuffer, GRALLOC_USAGE_SW_WRITE_RARELY,
-                 0, 0, m->info.xres, m->info.yres, &fb_vaddr);
-
-    m->base.lock(&m->base, buffer, GRALLOC_USAGE_SW_READ_RARELY,
-                 0, 0, m->info.xres, m->info.yres, &buffer_vaddr);
-
-    // Do a direct copy.
-    // TODO: Implement a copybit HAL for this
-    memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
-    m->base.unlock(&m->base, buffer);
-    m->base.unlock(&m->base, m->framebuffer);
-}
-
-/*****************************************************************************/
 
 /*
  * Keep track of the vsync state to avoid making excessive ioctl calls.
@@ -127,25 +107,39 @@ static int fb_post(struct framebuffer_device_t* dev, buffer_handle_t buffer)
 
     private_handle_t const* hnd = reinterpret_cast<private_handle_t const*>(buffer);
     private_module_t* m = reinterpret_cast<private_module_t*>(dev->common.module);
-
-    if (m->flags & PAGE_FLIP) {
-        hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
-        pthread_mutex_lock(&m->queue_lock);
-        if(queue->isEmpty())
-            pthread_mutex_unlock(&m->queue_lock);
-        else {
-            private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
-            struct hwc_callback_entry entry = queue->top();
-            queue->pop();
-            pthread_mutex_unlock(&m->queue_lock);
-            entry.callback(entry.data, hnd);
-        }
-    } else {
-        // If we can't do the page_flip, just copy the buffer to the front
-        // FIXME: use copybit HAL instead of memcpy
-        memcpy_buffer(m, buffer);
+#if HWC_EXIST
+    hwc_callback_queue_t *queue = reinterpret_cast<hwc_callback_queue_t *>(m->queue);
+    pthread_mutex_lock(&m->queue_lock);
+    if(queue->isEmpty())
+        pthread_mutex_unlock(&m->queue_lock);
+    else {
+        private_handle_t *hnd = private_handle_t::dynamicCast(buffer);
+        struct hwc_callback_entry entry = queue->top();
+        queue->pop();
+        pthread_mutex_unlock(&m->queue_lock);
+        entry.callback(entry.data, hnd);
     }
+#else
+    // If we can't do the page_flip, just copy the buffer to the front
+    // FIXME: use copybit HAL instead of memcpy
+    void* fb_vaddr;
+    void* buffer_vaddr;
 
+    m->base.lock(&m->base, m->framebuffer,
+            GRALLOC_USAGE_SW_WRITE_RARELY,
+            0, 0, m->info.xres, m->info.yres,
+            &fb_vaddr);
+
+    m->base.lock(&m->base, buffer,
+            GRALLOC_USAGE_SW_READ_RARELY,
+            0, 0, m->info.xres, m->info.yres,
+            &buffer_vaddr);
+
+    memcpy(fb_vaddr, buffer_vaddr, m->finfo.line_length * m->info.yres);
+
+    m->base.unlock(&m->base, buffer);
+    m->base.unlock(&m->base, m->framebuffer);
+#endif
     return 0;
 }
 
@@ -170,7 +164,6 @@ int init_fb(struct private_module_t* module)
 
     int fd = -1;
     int i = 0;
-    uint32_t flags = PAGE_FLIP;
 
     fd = open("/dev/graphics/fb0", O_RDWR);
     if (fd < 0) {
@@ -190,31 +183,6 @@ int init_fb(struct private_module_t* module)
         ALOGE("First, Fail to get FB VScreen Info");
         close(fd);
         return -errno;
-    }
-
-    /*
-     * Request NUM_BUFFERS screens (at lest 2 for page flipping)
-     */
-    int buf_size = roundUpToPageSize(info.yres * info.xres * (info.bits_per_pixel / 8));
-    int numberOfBuffers = (int)(finfo.smem_len / buf_size);
-    ALOGV("Number of supported framebuffers in kernel: %d", numberOfBuffers);
-
-    info.yres_virtual = info.yres * numberOfBuffers;
-
-    if (ioctl(fd, FBIOPUT_VSCREENINFO, &info) == -1)
-    {
-        info.yres_virtual = info.yres;
-        flags &= ~PAGE_FLIP;
-        ALOGW("FBIOPUT_VSCREENINFO failed, page flipping not supported fd: %d", fd );
-    }
-
-    if (info.yres_virtual < info.yres * 2)
-    {
-        // we need at least 2 for page-flipping
-        info.yres_virtual = info.yres;
-        flags &= ~PAGE_FLIP;
-        ALOGW("page flipping not supported (yres_virtual=%d, requested=%d)",
-              info.yres_virtual, info.yres*2 );
     }
 
     int refreshRate = 1000000000000000LLU /
@@ -248,7 +216,6 @@ int init_fb(struct private_module_t* module)
     module->fps = fps;
     module->info = info;
     module->finfo = finfo;
-    module->flags = flags;
 
     size_t fbSize = roundUpToPageSize(finfo.line_length * info.yres_virtual);
     module->framebuffer = new private_handle_t(dup(fd), fbSize, 0);
@@ -267,7 +234,7 @@ int init_fb(struct private_module_t* module)
     return 0;
 }
 
-static int fb_compositionComplete(struct framebuffer_device_t* dev __unused)
+int compositionComplete(struct framebuffer_device_t* dev)
 {
     /* By doing a finish here we force the GL driver to start rendering
      all the drawcalls up to this point, and to wait for the rendering to be complete.*/
@@ -286,7 +253,7 @@ static int fb_compositionComplete(struct framebuffer_device_t* dev __unused)
     return 0;
 }
 
-int fb_device_open(hw_module_t const* module, const char* name __unused,
+int fb_device_open(hw_module_t const* module, const char* name,
                    hw_device_t** device)
 {
     int status = -EINVAL;
@@ -336,7 +303,7 @@ int fb_device_open(hw_module_t const* module, const char* name __unused,
     dev->setSwapInterval = fb_setSwapInterval;
     dev->post = fb_post;
     dev->setUpdateRect = 0;
-    dev->compositionComplete = fb_compositionComplete;
+    dev->compositionComplete = &compositionComplete;
     m->queue = new hwc_callback_queue_t;
     pthread_mutex_init(&m->queue_lock, NULL);
 
